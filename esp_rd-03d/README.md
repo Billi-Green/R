@@ -41,7 +41,7 @@ radar_sensor_t radar;
 
 void app_main() {
     // Initialize the radar sensor
-    esp_err_t ret = radar_sensor_init(&radar, UART_NUM_2, GPIO_NUM_16, GPIO_NUM_17);
+    esp_err_t ret = radar_sensor_init(&radar, UART_NUM_2, GPIO_NUM_2, GPIO_NUM_1);
     if (ret != ESP_OK) {
         ESP_LOGE("MAIN", "Failed to initialize radar sensor");
         return;
@@ -102,7 +102,7 @@ Start UART communication with the specified baud rate.
 **Parameters:**
 
 - `sensor`: Pointer to initialized radar sensor
-- `baud_rate`: Communication baud rate (typically 115200)
+- `baud_rate`: Communication baud rate (`256000` for the RD-03D)
 
 #### `radar_sensor_update()`
 
@@ -201,7 +201,7 @@ void configure_radar_for_security() {
 
     // Initialize radar
     radar_sensor_init(&radar, UART_NUM_2, GPIO_NUM_16, GPIO_NUM_17);
-    radar_sensor_begin(&radar, 115200);
+    radar_sensor_begin(&radar, 256000);
 
     // Configure for security application (longer retention)
     radar_sensor_set_retention_times(&radar, 10000, 500); // 10s detection, 0.5s absence
@@ -275,7 +275,7 @@ switch (ret) {
 ### No Target Detection
 
 1. Verify UART connections (RX/TX pins)
-2. Check baud rate configuration (115200 is standard)
+2. Check baud rate configuration (`256000` for the RD-03D)
 3. Ensure adequate power supply to the radar module
 4. Verify the radar module is configured for the correct output format
 

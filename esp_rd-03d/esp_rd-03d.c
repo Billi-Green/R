@@ -7,9 +7,96 @@
 
 static const char* TAG = "ESP_RD_03D";
 
+static const uint8_t RADAR_CONFIG_BEGIN_COMMAND[14] = {
+    0xFD, 0xFC, 0xFB, 0xFA,
+    0x04, 0x00,
+    0xFF, 0x00,
+    0x01, 0x00,
+    0x04, 0x03, 0x02, 0x01,
+};
+
+static const uint8_t RADAR_MULTI_TARGET_COMMAND[12] = {
+    0xFD, 0xFC, 0xFB, 0xFA,
+    0x02, 0x00,
+    0x90, 0x00,
+    0x04, 0x03, 0x02, 0x01,
+};
+
+static const uint8_t RADAR_CONFIG_END_COMMAND[12] = {
+    0xFD, 0xFC, 0xFB, 0xFA,
+    0x02, 0x00,
+    0xFE, 0x00,
+    0x04, 0x03, 0x02, 0x01,
+};
+
 // Private function to update retention logic
 static void radar_sensor_update_retention(radar_sensor_t* sensor,
                                           bool sample_updated);
+
+static esp_err_t radar_sensor_send_command(radar_sensor_t* sensor,
+                                           const uint8_t* command,
+                                           size_t command_len,
+                                           const char* name) {
+  static const uint8_t ack_header[4] = {0xFD, 0xFC, 0xFB, 0xFA};
+  static const uint8_t ack_tail[4] = {0x04, 0x03, 0x02, 0x01};
+  uint8_t response[32] = {0};
+  size_t response_len = 0;
+  size_t header_index = 0;
+  bool collecting = false;
+
+  uart_flush_input(sensor->uart_port);
+  int written = uart_write_bytes(sensor->uart_port, command, command_len);
+  if (written != (int)command_len) {
+    ESP_LOGW(TAG, "%s write incomplete: %d/%u", name, written,
+             (unsigned)command_len);
+    return ESP_FAIL;
+  }
+  (void)uart_wait_tx_done(sensor->uart_port, pdMS_TO_TICKS(100));
+
+  TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(500);
+  while ((int32_t)(xTaskGetTickCount() - deadline) < 0) {
+    uint8_t byte_in = 0;
+    if (uart_read_bytes(sensor->uart_port, &byte_in, 1,
+                        pdMS_TO_TICKS(20)) <= 0) {
+      continue;
+    }
+
+    if (!collecting) {
+      if (byte_in == ack_header[header_index]) {
+        header_index++;
+        if (header_index == sizeof(ack_header)) {
+          memcpy(response, ack_header, sizeof(ack_header));
+          response_len = sizeof(ack_header);
+          collecting = true;
+        }
+      } else {
+        header_index = byte_in == ack_header[0] ? 1 : 0;
+      }
+      continue;
+    }
+
+    if (response_len >= sizeof(response)) {
+      return ESP_FAIL;
+    }
+    response[response_len++] = byte_in;
+    if (response_len >= sizeof(ack_tail) &&
+        memcmp(response + response_len - sizeof(ack_tail), ack_tail,
+               sizeof(ack_tail)) == 0) {
+      if (response_len >= 10 &&
+          (response[8] != 0x00 || response[9] != 0x00)) {
+        ESP_LOGW(TAG, "%s returned failure status %02X %02X", name,
+                 response[8], response[9]);
+        return ESP_FAIL;
+      }
+      ESP_LOGI(TAG, "%s ACK received (%u bytes)", name,
+               (unsigned)response_len);
+      return ESP_OK;
+    }
+  }
+
+  ESP_LOGW(TAG, "%s ACK timeout", name);
+  return ESP_ERR_TIMEOUT;
+}
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -29,35 +116,39 @@ esp_err_t radar_sensor_init(radar_sensor_t* sensor,
   sensor->buffer_index = 0;
   sensor->parser_state = WAIT_AA;
   sensor->frame_count = 0;
+  sensor->rx_byte_count = 0;
+  sensor->invalid_frame_count = 0;
+  sensor->rx_sample_count = 0;
   sensor->last_frame_time = xTaskGetTickCount();
 
-  // Initialize target structures
-  sensor->target.detected = false;
-  sensor->target.x = 0.0f;
-  sensor->target.y = 0.0f;
-  sensor->target.speed = 0.0f;
-  sensor->target.distance = 0.0f;
-  sensor->target.angle = 0.0f;
-  strcpy(sensor->target.position_description, "No target");
+  for (size_t i = 0; i < RADAR_MAX_TARGETS; ++i) {
+    sensor->target[i].target_id = (uint8_t)i;
+    sensor->target[i].detected = false;
+    sensor->target[i].x = 0.0f;
+    sensor->target[i].y = 0.0f;
+    sensor->target[i].speed = 0.0f;
+    sensor->target[i].distance = 0.0f;
+    sensor->target[i].angle = 0.0f;
+    strcpy(sensor->target[i].position_description, "No target");
 
-  sensor->raw_target =
-      sensor->target;  // Initialize raw target same as filtered
+    sensor->raw_target[i] = sensor->target[i];
 
-  // Initialize retention system with default values
-  sensor->retention.detection_retention_ms =
-      RADAR_DEFAULT_DETECTION_RETENTION_MS;
-  sensor->retention.absence_retention_ms = RADAR_DEFAULT_ABSENCE_RETENTION_MS;
-  sensor->retention.last_detection_time = sensor->last_frame_time;
-  sensor->retention.last_absence_time = sensor->last_frame_time;
-  sensor->retention.raw_detected = false;
-  sensor->retention.filtered_detected = false;
-  sensor->retention.retention_enabled = true;  // Enable by default
+    sensor->retention[i].detection_retention_ms =
+        RADAR_DEFAULT_DETECTION_RETENTION_MS;
+    sensor->retention[i].absence_retention_ms =
+        RADAR_DEFAULT_ABSENCE_RETENTION_MS;
+    sensor->retention[i].last_detection_time = sensor->last_frame_time;
+    sensor->retention[i].last_absence_time = sensor->last_frame_time;
+    sensor->retention[i].raw_detected = false;
+    sensor->retention[i].filtered_detected = false;
+    sensor->retention[i].retention_enabled = true;
+  }
 
   ESP_LOGI(TAG,
            "Radar sensor initialized with retention: detection=%lu ms, "
            "absence=%lu ms",
-           sensor->retention.detection_retention_ms,
-           sensor->retention.absence_retention_ms);
+            sensor->retention[0].detection_retention_ms,
+            sensor->retention[0].absence_retention_ms);
 
   return ESP_OK;
 }
@@ -94,6 +185,21 @@ esp_err_t radar_sensor_begin(radar_sensor_t* sensor, uint32_t baud_rate) {
     return ret;
   }
 
+  vTaskDelay(pdMS_TO_TICKS(200));
+  ret = radar_sensor_send_command(sensor, RADAR_CONFIG_BEGIN_COMMAND,
+                                  sizeof(RADAR_CONFIG_BEGIN_COMMAND),
+                                  "RD-03D config begin");
+  if (ret == ESP_OK) {
+    (void)radar_sensor_send_command(sensor, RADAR_MULTI_TARGET_COMMAND,
+                                    sizeof(RADAR_MULTI_TARGET_COMMAND),
+                                    "RD-03D multi-target mode");
+    (void)radar_sensor_send_command(sensor, RADAR_CONFIG_END_COMMAND,
+                                    sizeof(RADAR_CONFIG_END_COMMAND),
+                                    "RD-03D config end");
+  } else {
+    ESP_LOGW(TAG, "RD-03D configuration handshake failed; using default mode");
+  }
+
   return ESP_OK;
 }
 
@@ -106,6 +212,10 @@ bool radar_sensor_update(radar_sensor_t* sensor) {
   uint8_t byte_in;
 
   while (uart_read_bytes(sensor->uart_port, &byte_in, 1, 0) > 0) {
+    sensor->rx_byte_count++;
+    if (sensor->rx_sample_count < RADAR_RX_SAMPLE_SIZE) {
+      sensor->rx_sample[sensor->rx_sample_count++] = byte_in;
+    }
     switch (sensor->parser_state) {
       case WAIT_AA:
         if (byte_in == 0xAA) {
@@ -145,6 +255,8 @@ bool radar_sensor_update(radar_sensor_t* sensor) {
           if (sensor->buffer[24] == 0x55 && sensor->buffer[25] == 0xCC) {
             data_updated = radar_sensor_parse_data(sensor, sensor->buffer,
                                                    RADAR_FRAME_SIZE);
+          } else {
+            sensor->invalid_frame_count++;
           }
           sensor->parser_state = WAIT_AA;
           sensor->buffer_index = 0;
@@ -166,41 +278,34 @@ bool radar_sensor_parse_data(radar_sensor_t* sensor,
     return false;
   }
 
-  // Parse first 8 bytes for the first target
-  uint16_t raw_x = buf[0] | (buf[1] << 8);
-  uint16_t raw_y = buf[2] | (buf[3] << 8);
-  uint16_t raw_speed = buf[4] | (buf[5] << 8);
-  uint16_t raw_pixel_dist = buf[6] | (buf[7] << 8);
+  for (size_t target_id = 0; target_id < RADAR_MAX_TARGETS; ++target_id) {
+    size_t offset = target_id * 8;
+    uint16_t raw_x = buf[offset] | (buf[offset + 1] << 8);
+    uint16_t raw_y = buf[offset + 2] | (buf[offset + 3] << 8);
+    uint16_t raw_speed = buf[offset + 4] | (buf[offset + 5] << 8);
+    uint16_t raw_pixel_dist = buf[offset + 6] | (buf[offset + 7] << 8);
+    radar_target_t* target = &sensor->raw_target[target_id];
 
-  // Store raw target data (unfiltered)
-  sensor->raw_target.detected =
-      !(raw_x == 0 && raw_y == 0 && raw_pixel_dist == 0);
+    target->target_id = (uint8_t)target_id;
+    target->detected = !(raw_x == 0 && raw_y == 0 && raw_speed == 0 &&
+                         raw_pixel_dist == 0);
+    target->x = ((raw_x & 0x8000) ? 1 : -1) * (raw_x & 0x7FFF);
+    target->y = ((raw_y & 0x8000) ? 1 : -1) * (raw_y & 0x7FFF);
+    target->speed = ((raw_speed & 0x8000) ? 1 : -1) * (raw_speed & 0x7FFF);
 
-  // Parse signed values
-  sensor->raw_target.x = ((raw_x & 0x8000) ? 1 : -1) * (raw_x & 0x7FFF);
-  sensor->raw_target.y = ((raw_y & 0x8000) ? 1 : -1) * (raw_y & 0x7FFF);
-  sensor->raw_target.speed =
-      ((raw_speed & 0x8000) ? 1 : -1) * (raw_speed & 0x7FFF);
+    if (target->detected) {
+      target->distance = sqrtf(target->x * target->x + target->y * target->y);
+      target->angle = atan2f(target->x, target->y) * (180.0f / M_PI);
+      radar_sensor_update_position_description(target);
+    } else {
+      target->distance = 0.0f;
+      target->angle = 0.0f;
+      strcpy(target->position_description, "No target");
+    }
 
-  if (sensor->raw_target.detected) {
-    sensor->raw_target.distance =
-        sqrtf(sensor->raw_target.x * sensor->raw_target.x +
-              sensor->raw_target.y * sensor->raw_target.y);
-
-    // Positive X is left and positive Y is forward, so zero is straight ahead.
-    sensor->raw_target.angle =
-        atan2f(sensor->raw_target.x, sensor->raw_target.y) * (180.0f / M_PI);
-
-    // Update position description
-    radar_sensor_update_position_description(&sensor->raw_target);
-  } else {
-    sensor->raw_target.distance = 0.0f;
-    sensor->raw_target.angle = 0.0f;
-    strcpy(sensor->raw_target.position_description, "No target");
+    sensor->retention[target_id].raw_detected = target->detected;
   }
 
-  // Update retention state
-  sensor->retention.raw_detected = sensor->raw_target.detected;
   sensor->frame_count++;
   sensor->last_frame_time = xTaskGetTickCount();
 
@@ -209,83 +314,56 @@ bool radar_sensor_parse_data(radar_sensor_t* sensor,
 
 static void radar_sensor_update_retention(radar_sensor_t* sensor,
                                           bool sample_updated) {
-  if (!sensor->retention.retention_enabled) {
-    // If retention is disabled, just pass through raw data
-    sensor->target = sensor->raw_target;
-    sensor->retention.filtered_detected = sensor->retention.raw_detected;
-    return;
-  }
-
   TickType_t current_time = xTaskGetTickCount();
-  bool state_changed = false;
+  for (size_t target_id = 0; target_id < RADAR_MAX_TARGETS; ++target_id) {
+    radar_retention_t* retention = &sensor->retention[target_id];
+    radar_target_t* target = &sensor->target[target_id];
+    const radar_target_t* raw_target = &sensor->raw_target[target_id];
 
-  // Update timing only when a complete frame was received. This prevents a
-  // stalled UART from keeping a stale target alive forever.
-  if (sample_updated) {
-    if (sensor->retention.raw_detected) {
-      sensor->retention.last_detection_time = current_time;
-    } else {
-      sensor->retention.last_absence_time = current_time;
+    if (!retention->retention_enabled) {
+      *target = *raw_target;
+      retention->filtered_detected = retention->raw_detected;
+      continue;
     }
-  }
 
-  // State machine for filtered detection
-  if (sensor->retention.filtered_detected) {
-    // Currently in "detected" state
-    if (sensor->retention.raw_detected) {
-      // Still detecting, stay in detected state
-      // Copy the latest raw target data to filtered target
-      sensor->target = sensor->raw_target;
-    } else {
-      // No longer detecting raw target
-      uint32_t time_since_detection =
-          (current_time - sensor->retention.last_detection_time) *
-          portTICK_PERIOD_MS;
-
-      if (time_since_detection >= sensor->retention.detection_retention_ms) {
-        // Retention time exceeded, switch to not detected
-        sensor->retention.filtered_detected = false;
-        sensor->target.detected = false;
-        sensor->target.x = 0.0f;
-        sensor->target.y = 0.0f;
-        sensor->target.speed = 0.0f;
-        sensor->target.distance = 0.0f;
-        sensor->target.angle = 0.0f;
-        strcpy(sensor->target.position_description, "No target");
-        state_changed = true;
-
-        ESP_LOGI(TAG, "Target lost after %lu ms retention",
-                 (unsigned long)time_since_detection);
+    if (sample_updated) {
+      if (retention->raw_detected) {
+        retention->last_detection_time = current_time;
+      } else {
+        retention->last_absence_time = current_time;
       }
-      // else: stay in detected state (retention active)
     }
-  } else {
-    // Currently in "not detected" state
-    if (sensor->retention.raw_detected) {
-      // Raw target detected
-      uint32_t time_since_absence =
-          (current_time - sensor->retention.last_absence_time) *
-          portTICK_PERIOD_MS;
 
-      if (time_since_absence >= sensor->retention.absence_retention_ms) {
-        // Absence retention time exceeded, confirm detection
-        sensor->retention.filtered_detected = true;
-        sensor->target = sensor->raw_target;
-        state_changed = true;
-
-        ESP_LOGI(TAG, "Target confirmed after %lu ms absence retention",
-                 (unsigned long)time_since_absence);
+    if (retention->filtered_detected) {
+      if (retention->raw_detected) {
+        *target = *raw_target;
+      } else {
+        uint32_t elapsed =
+            (current_time - retention->last_detection_time) *
+            portTICK_PERIOD_MS;
+        if (elapsed >= retention->detection_retention_ms) {
+          retention->filtered_detected = false;
+          target->detected = false;
+          target->x = 0.0f;
+          target->y = 0.0f;
+          target->speed = 0.0f;
+          target->distance = 0.0f;
+          target->angle = 0.0f;
+          strcpy(target->position_description, "No target");
+          ESP_LOGI(TAG, "Target %u lost after %lu ms retention",
+                   (unsigned)target_id, (unsigned long)elapsed);
+        }
       }
-      // else: stay in not detected state (absence retention active)
-    } else {
-      // Still no raw target, stay in not detected state
-      // Keep target data as zeros (already set)
+    } else if (retention->raw_detected) {
+      uint32_t elapsed =
+          (current_time - retention->last_absence_time) * portTICK_PERIOD_MS;
+      if (elapsed >= retention->absence_retention_ms) {
+        retention->filtered_detected = true;
+        *target = *raw_target;
+        ESP_LOGI(TAG, "Target %u confirmed after %lu ms absence retention",
+                 (unsigned)target_id, (unsigned long)elapsed);
+      }
     }
-  }
-
-  if (state_changed) {
-    ESP_LOGI(TAG, "Retention state changed to %s",
-             sensor->retention.filtered_detected ? "DETECTED" : "NOT_DETECTED");
   }
 }
 
@@ -295,7 +373,7 @@ radar_target_t radar_sensor_get_target(radar_sensor_t* sensor) {
     return empty_target;
   }
 
-  return sensor->target;  // Returns filtered target
+  return sensor->target[0];  // Compatibility accessor for target slot 0.
 }
 
 radar_target_t radar_sensor_get_raw_target(radar_sensor_t* sensor) {
@@ -304,7 +382,41 @@ radar_target_t radar_sensor_get_raw_target(radar_sensor_t* sensor) {
     return empty_target;
   }
 
-  return sensor->raw_target;  // Returns unfiltered raw target
+  return sensor->raw_target[0];  // Compatibility accessor for target slot 0.
+}
+
+void radar_sensor_get_targets(radar_sensor_t* sensor,
+                              radar_target_t* targets,
+                              size_t target_count) {
+  if (!sensor || !targets) return;
+  if (target_count > RADAR_MAX_TARGETS) target_count = RADAR_MAX_TARGETS;
+  memcpy(targets, sensor->target, target_count * sizeof(*targets));
+}
+
+void radar_sensor_get_raw_targets(radar_sensor_t* sensor,
+                                  radar_target_t* targets,
+                                  size_t target_count) {
+  if (!sensor || !targets) return;
+  if (target_count > RADAR_MAX_TARGETS) target_count = RADAR_MAX_TARGETS;
+  memcpy(targets, sensor->raw_target, target_count * sizeof(*targets));
+}
+
+uint8_t radar_sensor_get_target_count(radar_sensor_t* sensor) {
+  if (!sensor) return 0;
+  uint8_t count = 0;
+  for (size_t i = 0; i < RADAR_MAX_TARGETS; ++i) {
+    if (sensor->target[i].detected) ++count;
+  }
+  return count;
+}
+
+uint8_t radar_sensor_get_raw_target_count(radar_sensor_t* sensor) {
+  if (!sensor) return 0;
+  uint8_t count = 0;
+  for (size_t i = 0; i < RADAR_MAX_TARGETS; ++i) {
+    if (sensor->raw_target[i].detected) ++count;
+  }
+  return count;
 }
 
 uint32_t radar_sensor_get_frame_age_ms(radar_sensor_t* sensor) {
@@ -319,6 +431,25 @@ uint32_t radar_sensor_get_frame_count(radar_sensor_t* sensor) {
   return sensor ? sensor->frame_count : 0;
 }
 
+uint32_t radar_sensor_get_rx_byte_count(radar_sensor_t* sensor) {
+  return sensor ? sensor->rx_byte_count : 0;
+}
+
+uint32_t radar_sensor_get_invalid_frame_count(radar_sensor_t* sensor) {
+  return sensor ? sensor->invalid_frame_count : 0;
+}
+
+size_t radar_sensor_copy_rx_sample(radar_sensor_t* sensor,
+                                   uint8_t* out,
+                                   size_t out_len) {
+  if (!sensor || !out || out_len == 0) return 0;
+  size_t count = sensor->rx_sample_count < out_len
+                     ? sensor->rx_sample_count
+                     : out_len;
+  memcpy(out, sensor->rx_sample, count);
+  return count;
+}
+
 void radar_sensor_set_retention_times(radar_sensor_t* sensor,
                                       uint32_t detection_retention_ms,
                                       uint32_t absence_retention_ms) {
@@ -326,8 +457,10 @@ void radar_sensor_set_retention_times(radar_sensor_t* sensor,
     return;
   }
 
-  sensor->retention.detection_retention_ms = detection_retention_ms;
-  sensor->retention.absence_retention_ms = absence_retention_ms;
+  for (size_t i = 0; i < RADAR_MAX_TARGETS; ++i) {
+    sensor->retention[i].detection_retention_ms = detection_retention_ms;
+    sensor->retention[i].absence_retention_ms = absence_retention_ms;
+  }
 
   ESP_LOGI(TAG, "Retention times updated: detection=%lu ms, absence=%lu ms",
            detection_retention_ms, absence_retention_ms);
@@ -338,12 +471,12 @@ void radar_sensor_enable_retention(radar_sensor_t* sensor, bool enable) {
     return;
   }
 
-  sensor->retention.retention_enabled = enable;
-
-  if (!enable) {
-    // If disabling retention, immediately sync filtered state with raw state
-    sensor->target = sensor->raw_target;
-    sensor->retention.filtered_detected = sensor->retention.raw_detected;
+  for (size_t i = 0; i < RADAR_MAX_TARGETS; ++i) {
+    sensor->retention[i].retention_enabled = enable;
+    if (!enable) {
+      sensor->target[i] = sensor->raw_target[i];
+      sensor->retention[i].filtered_detected = sensor->retention[i].raw_detected;
+    }
   }
 
   ESP_LOGI(TAG, "Target retention %s", enable ? "enabled" : "disabled");
@@ -355,33 +488,40 @@ void radar_sensor_reset_retention(radar_sensor_t* sensor) {
   }
 
   TickType_t current_time = xTaskGetTickCount();
-  sensor->retention.last_detection_time = current_time;
-  sensor->retention.last_absence_time = current_time;
-  sensor->retention.filtered_detected = sensor->retention.raw_detected;
+  for (size_t i = 0; i < RADAR_MAX_TARGETS; ++i) {
+    sensor->retention[i].last_detection_time = current_time;
+    sensor->retention[i].last_absence_time = current_time;
+    sensor->retention[i].filtered_detected = sensor->retention[i].raw_detected;
 
-  if (sensor->retention.raw_detected) {
-    sensor->target = sensor->raw_target;
-  } else {
-    sensor->target.detected = false;
-    sensor->target.x = 0.0f;
-    sensor->target.y = 0.0f;
-    sensor->target.speed = 0.0f;
-    sensor->target.distance = 0.0f;
-    sensor->target.angle = 0.0f;
-    strcpy(sensor->target.position_description, "No target");
+    if (sensor->retention[i].raw_detected) {
+      sensor->target[i] = sensor->raw_target[i];
+    } else {
+      sensor->target[i].detected = false;
+      sensor->target[i].x = 0.0f;
+      sensor->target[i].y = 0.0f;
+      sensor->target[i].speed = 0.0f;
+      sensor->target[i].distance = 0.0f;
+      sensor->target[i].angle = 0.0f;
+      strcpy(sensor->target[i].position_description, "No target");
+    }
   }
 
   ESP_LOGI(TAG, "Retention state reset");
 }
 
 bool radar_sensor_is_retention_active(radar_sensor_t* sensor) {
-  if (!sensor || !sensor->retention.retention_enabled) {
+  if (!sensor || !sensor->retention[0].retention_enabled) {
     return false;
   }
 
   // Retention is active if filtered state differs from raw state
-  return (sensor->retention.filtered_detected !=
-          sensor->retention.raw_detected);
+  for (size_t i = 0; i < RADAR_MAX_TARGETS; ++i) {
+    if (sensor->retention[i].filtered_detected !=
+        sensor->retention[i].raw_detected) {
+      return true;
+    }
+  }
+  return false;
 }
 
 uint32_t radar_sensor_get_time_since_last_detection(radar_sensor_t* sensor) {
@@ -390,7 +530,7 @@ uint32_t radar_sensor_get_time_since_last_detection(radar_sensor_t* sensor) {
   }
 
   TickType_t current_time = xTaskGetTickCount();
-  return (current_time - sensor->retention.last_detection_time) *
+  return (current_time - sensor->retention[0].last_detection_time) *
          portTICK_PERIOD_MS;
 }
 
@@ -400,7 +540,7 @@ uint32_t radar_sensor_get_time_since_last_absence(radar_sensor_t* sensor) {
   }
 
   TickType_t current_time = xTaskGetTickCount();
-  return (current_time - sensor->retention.last_absence_time) *
+  return (current_time - sensor->retention[0].last_absence_time) *
          portTICK_PERIOD_MS;
 }
 

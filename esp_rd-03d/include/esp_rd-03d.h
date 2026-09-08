@@ -13,12 +13,15 @@
 #define RADAR_BUFFER_SIZE 30
 #define RADAR_FRAME_SIZE 24
 #define RADAR_FULL_FRAME_SIZE 26
+#define RADAR_RX_SAMPLE_SIZE 32
+#define RADAR_MAX_TARGETS 3
 
 // Default retention times in milliseconds
 #define RADAR_DEFAULT_DETECTION_RETENTION_MS 3000  // 3 seconds
 #define RADAR_DEFAULT_ABSENCE_RETENTION_MS 1000    // 1 second
 
 typedef struct {
+  uint8_t target_id;
   bool detected;
   float x;
   float y;
@@ -52,13 +55,17 @@ typedef struct {
   uart_port_t uart_port;
   gpio_num_t rx_pin;
   gpio_num_t tx_pin;
-  radar_target_t target;
-  radar_target_t raw_target;  // Raw unfiltered target data
+  radar_target_t target[RADAR_MAX_TARGETS];
+  radar_target_t raw_target[RADAR_MAX_TARGETS];  // Raw unfiltered target data
   uint8_t buffer[RADAR_BUFFER_SIZE];
   size_t buffer_index;
   radar_parser_state_t parser_state;
-  radar_retention_t retention;  // Target retention management
+  radar_retention_t retention[RADAR_MAX_TARGETS];  // Target retention management
   uint32_t frame_count;
+  uint32_t rx_byte_count;
+  uint32_t invalid_frame_count;
+  uint8_t rx_sample[RADAR_RX_SAMPLE_SIZE];
+  size_t rx_sample_count;
   TickType_t last_frame_time;
 } radar_sensor_t;
 
@@ -74,8 +81,21 @@ bool radar_sensor_parse_data(radar_sensor_t* sensor,
                              size_t len);
 radar_target_t radar_sensor_get_target(radar_sensor_t* sensor);
 radar_target_t radar_sensor_get_raw_target(radar_sensor_t* sensor);
+void radar_sensor_get_targets(radar_sensor_t* sensor,
+                              radar_target_t* targets,
+                              size_t target_count);
+void radar_sensor_get_raw_targets(radar_sensor_t* sensor,
+                                  radar_target_t* targets,
+                                  size_t target_count);
+uint8_t radar_sensor_get_target_count(radar_sensor_t* sensor);
+uint8_t radar_sensor_get_raw_target_count(radar_sensor_t* sensor);
 uint32_t radar_sensor_get_frame_age_ms(radar_sensor_t* sensor);
 uint32_t radar_sensor_get_frame_count(radar_sensor_t* sensor);
+uint32_t radar_sensor_get_rx_byte_count(radar_sensor_t* sensor);
+uint32_t radar_sensor_get_invalid_frame_count(radar_sensor_t* sensor);
+size_t radar_sensor_copy_rx_sample(radar_sensor_t* sensor,
+                                   uint8_t* out,
+                                   size_t out_len);
 void radar_sensor_deinit(radar_sensor_t* sensor);
 
 // Target retention configuration functions

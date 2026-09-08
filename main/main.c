@@ -16,9 +16,9 @@
 #include <stdio.h>
 #include <string.h>
 
-#define RADAR_UART_PORT UART_NUM_1
-#define RADAR_UART_RX_PIN GPIO_NUM_1
-#define RADAR_UART_TX_PIN GPIO_NUM_2
+#define RADAR_UART_PORT UART_NUM_2
+#define RADAR_UART_RX_PIN GPIO_NUM_2
+#define RADAR_UART_TX_PIN GPIO_NUM_1
 #define RADAR_UART_BAUD 256000
 
 #define RADAR_CHANNEL 1
@@ -60,6 +60,9 @@ static uint8_t s_host_mac[6];
 static bool s_host_known;
 static bool s_streaming;
 static uint32_t s_sequence;
+static uint32_t s_telemetry_sent;
+static uint32_t s_telemetry_send_failures;
+static bool s_uart_sample_logged;
 
 static uint32_t uptime_ms(void) {
   return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
@@ -165,20 +168,31 @@ static void send_telemetry(void) {
     return;
   }
 
-  radar_target_t target = radar_sensor_get_raw_target(&s_radar);
+  radar_target_t targets[RADAR_MAX_TARGETS];
+  radar_sensor_get_raw_targets(&s_radar, targets, RADAR_MAX_TARGETS);
   uint32_t age_ms = radar_sensor_get_frame_age_ms(&s_radar);
-  bool detected = target.detected && age_ms <= RADAR_STALE_AFTER_MS;
-  long x = detected ? (long)target.x : 0;
-  long y = detected ? (long)target.y : 0;
-  long speed = detected ? (long)target.speed : 0;
-  long distance = detected ? (long)target.distance : 0;
-  long angle = detected ? (long)target.angle : 0;
+  bool fresh = age_ms <= RADAR_STALE_AFTER_MS;
+  uint32_t sequence = s_sequence++;
 
-  char text[RADAR_TEXT_MAX];
-  snprintf(text, sizeof(text), "RADAR,%lu,%u,%ld,%ld,%ld,%ld,%ld",
-           (unsigned long)s_sequence++, detected ? 1u : 0u, x, y, speed,
-           distance, angle);
-  (void)send_packet(s_host_mac, ESPNOW_TYPE_MESSAGE, text);
+  for (uint8_t target_id = 0; target_id < RADAR_MAX_TARGETS; ++target_id) {
+    radar_target_t *target = &targets[target_id];
+    bool detected = fresh && target->detected;
+    long x = detected ? (long)target->x : 0;
+    long y = detected ? (long)target->y : 0;
+    long speed = detected ? (long)target->speed : 0;
+    long distance = detected ? (long)target->distance : 0;
+    long angle = detected ? (long)target->angle : 0;
+
+    char text[RADAR_TEXT_MAX];
+    snprintf(text, sizeof(text), "RADAR,%lu,%u,%u,%ld,%ld,%ld,%ld,%ld",
+             (unsigned long)sequence, (unsigned)target_id, detected ? 1u : 0u,
+             x, y, speed, distance, angle);
+    if (send_packet(s_host_mac, ESPNOW_TYPE_MESSAGE, text)) {
+      s_telemetry_sent++;
+    } else {
+      s_telemetry_send_failures++;
+    }
+  }
 }
 
 static void initialize_nvs(void) {
@@ -224,11 +238,14 @@ void app_main(void) {
   ESP_ERROR_CHECK(radar_sensor_begin(&s_radar, RADAR_UART_BAUD));
   radar_sensor_enable_retention(&s_radar, false);
 
-  ESP_LOGI(TAG, "Ready as %s on ESP-NOW channel %u", s_name, RADAR_CHANNEL);
+  ESP_LOGI(TAG, "Ready as %s on ESP-NOW channel %u UART%u RX=%d TX=%d baud=%u",
+           s_name, RADAR_CHANNEL, RADAR_UART_PORT, RADAR_UART_RX_PIN,
+           RADAR_UART_TX_PIN, RADAR_UART_BAUD);
   send_hello();
 
   uint32_t last_hello = uptime_ms();
   uint32_t last_telemetry = uptime_ms();
+  uint32_t last_diagnostic = uptime_ms();
   while (true) {
     (void)radar_sensor_update(&s_radar);
     handle_commands();
@@ -241,6 +258,54 @@ void app_main(void) {
     if ((uint32_t)(now - last_telemetry) >= RADAR_TELEMETRY_INTERVAL_MS) {
       send_telemetry();
       last_telemetry = now;
+    }
+    if ((uint32_t)(now - last_diagnostic) >= 2000) {
+       radar_target_t raw_targets[RADAR_MAX_TARGETS];
+       radar_sensor_get_raw_targets(&s_radar, raw_targets, RADAR_MAX_TARGETS);
+       uint8_t raw_count = radar_sensor_get_raw_target_count(&s_radar);
+      int rx_level = gpio_get_level(RADAR_UART_RX_PIN);
+      int tx_level = gpio_get_level(RADAR_UART_TX_PIN);
+      if (!s_uart_sample_logged &&
+          radar_sensor_get_rx_byte_count(&s_radar) > 0) {
+        uint8_t sample[RADAR_RX_SAMPLE_SIZE];
+        size_t sample_len = radar_sensor_copy_rx_sample(
+            &s_radar, sample, sizeof(sample));
+        char hex[RADAR_RX_SAMPLE_SIZE * 3 + 1];
+        size_t hex_len = 0;
+        for (size_t i = 0; i < sample_len && hex_len + 3 < sizeof(hex); ++i) {
+          hex_len += (size_t)snprintf(hex + hex_len, sizeof(hex) - hex_len,
+                                      "%02X%s", sample[i],
+                                      i + 1 == sample_len ? "" : " ");
+        }
+        ESP_LOGI(TAG, "UART raw first %u bytes: %s", (unsigned)sample_len,
+                 hex);
+        s_uart_sample_logged = true;
+      }
+      ESP_LOGI(TAG,
+               "Diag: uart_bytes=%lu frames=%lu bad_frames=%lu age_ms=%lu "
+               "rx_level=%d tx_level=%d "
+                "raw_targets=%u t0=%d x=%.0f y=%.0f speed=%.0f dist=%.0f angle=%.0f "
+                "telemetry_sent=%lu tx_fail=%lu streaming=%d host=%d",
+               (unsigned long)radar_sensor_get_rx_byte_count(&s_radar),
+               (unsigned long)radar_sensor_get_frame_count(&s_radar),
+               (unsigned long)radar_sensor_get_invalid_frame_count(&s_radar),
+               (unsigned long)radar_sensor_get_frame_age_ms(&s_radar),
+               rx_level, tx_level,
+                (unsigned)raw_count, raw_targets[0].detected ? 1 : 0,
+                raw_targets[0].x, raw_targets[0].y, raw_targets[0].speed,
+                raw_targets[0].distance, raw_targets[0].angle,
+                (unsigned long)s_telemetry_sent,
+                (unsigned long)s_telemetry_send_failures, s_streaming ? 1 : 0,
+                s_host_known ? 1 : 0);
+       for (uint8_t target_id = 0; target_id < RADAR_MAX_TARGETS; ++target_id) {
+         if (raw_targets[target_id].detected) {
+           ESP_LOGI(TAG, "Target[%u]: x=%.0f y=%.0f speed=%.0f dist=%.0f angle=%.0f",
+                    (unsigned)target_id, raw_targets[target_id].x,
+                    raw_targets[target_id].y, raw_targets[target_id].speed,
+                    raw_targets[target_id].distance, raw_targets[target_id].angle);
+         }
+       }
+      last_diagnostic = now;
     }
     vTaskDelay(pdMS_TO_TICKS(10));
   }

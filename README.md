@@ -4,17 +4,21 @@ Standalone ESP-IDF firmware for an ESP32-S3 connected to an AI-Thinker RD-03D.
 
 ## Wiring
 
-- RD-03D TX -> ESP32-S3 GPIO 1 (UART RX)
-- RD-03D RX -> ESP32-S3 GPIO 2 (UART TX)
+- RD-03D VCC -> stable 5V supply
 - RD-03D GND -> ESP32-S3 GND
+- RD-03D TX -> ESP32-S3 GPIO 2 (UART RX)
+- RD-03D RX -> ESP32-S3 GPIO 1 (UART TX)
 
-The node uses UART1 at 256000 baud and ESP-NOW channel 1. It announces as
+The node uses UART2 at 256000 baud and ESP-NOW channel 1. It announces as
 `RD03D-XXXXXX`, accepts `RADAR_START` and `RADAR_STOP`, and sends compact
 telemetry messages compatible with the GhostESP ESP-NOW manager:
 
 ```text
-RADAR,sequence,detected,x_mm,y_mm,speed,distance_mm,angle_deg
+RADAR,sequence,target_id,detected,x_mm,y_mm,speed,distance_mm,angle_deg
 ```
+
+The radar node uses RD-03D multi-target mode and sends one telemetry message
+for each of the three target slots on every update.
 
 ## Build
 
