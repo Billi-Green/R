@@ -200,7 +200,7 @@ void configure_radar_for_security() {
     radar_sensor_t radar;
 
     // Initialize radar
-    radar_sensor_init(&radar, UART_NUM_2, GPIO_NUM_16, GPIO_NUM_17);
+    radar_sensor_init(&radar, UART_NUM_2, GPIO_NUM_2, GPIO_NUM_1);
     radar_sensor_begin(&radar, 256000);
 
     // Configure for security application (longer retention)
