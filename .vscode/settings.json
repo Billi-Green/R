@@ -1,5 +1,14 @@
 {
-    "idf.currentSetup": "c:\\Users\\n\\master\\esp-idf",
-    "idf.portWin": "COM14",
-    "idf.flashType": "UART"
+  "idf.currentSetup": "C:\\esp-idf 6.1\\.espressif\\v6.1\\esp-idf",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32s3"
+  },
+  "clangd.path": "C:\\Espressif\\tools\\esp-clangd\\esp-21.1.3_20260408\\esp-clangd\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=c:\\Users\\n\\Documents\\GitHub\\Radar\\build"
+  ],
+  "idf.portWin": "COM14",
+  "idf.flashType": "UART"
 }

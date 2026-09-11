@@ -1,11 +1,17 @@
 idf_component_register(
-    SRCS "main.c"
-    INCLUDE_DIRS "."
+    SRCS
+        "main.c"
+        "esp_rd-03d.c"
+    INCLUDE_DIRS
+        "."
+        "include"
     REQUIRES
-        esp_rd-03d
+        esp_common
+        esp_driver_gpio
+        esp_driver_uart
         esp_event
         esp_netif
         esp_wifi
-        esp_driver_uart
+        log
         nvs_flash
 )

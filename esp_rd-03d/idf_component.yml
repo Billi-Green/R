@@ -1,6 +1,0 @@
-dependencies:
-  idf: '>=5.0'
-description: ESP-IDF component for Ai-Thinker RD-03D mmWave Radar Sensor
-license: MIT
-url: https://github.com/heronet/esp_rd-03d
-version: 1.0.0

@@ -34,8 +34,8 @@ idf.py build
 idf.py -p COM14 flash monitor
 ```
 
-Replace `COM14` with the serial port for the ESP32-S3. The local
-`esp_rd-03d` component is registered through `EXTRA_COMPONENT_DIRS`.
+Replace `COM14` with the serial port for the ESP32-S3. The radar driver is
+part of the `main` component.
 
 ## Make Your Own Node
 
@@ -126,6 +126,9 @@ The GhostESP app displays distance and position in metres, but the wire format
 remains millimetres for compatibility.
 
 ## Diagnostics
+
+The radar driver is compiled directly into the `main` component from
+`main/esp_rd-03d.c` and `main/include/esp_rd-03d.h`.
 
 The node prints a diagnostic line every two seconds containing UART byte count,
 decoded frame count, frame age, target data, and ESP-NOW send counts.
