@@ -9,7 +9,7 @@ Required parts:
 
 - ESP32-S3 development board
 - AI-Thinker RD-03D radar module
-- Stable 5V supply for the radar module
+- 3.3V-to-5V boost/buck-boost converter for a stable 5V radar supply
 - Common ground between the ESP32-S3 and radar module
 
 Default wiring:
@@ -26,7 +26,7 @@ to the ESP32 TX pin. Do not power the radar from an overloaded 3.3V rail.
 
 ## Build And Flash
 
-Use ESP-IDF 6.0.2 from an activated ESP-IDF PowerShell session:
+Use ESP-IDF 6.1 from an activated ESP-IDF PowerShell session:
 
 ```powershell
 idf.py set-target esp32s3
